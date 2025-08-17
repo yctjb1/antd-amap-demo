@@ -24,6 +24,7 @@ import {
   theme,
   Tabs,
   DatePicker,
+  Tree,
 } from 'antd'
 import useCesiumViewer from '../components/useCesiumViewer'
 import CustomButton from '../components/CustomButton'
@@ -32,6 +33,11 @@ import { ModelStatus, MapItemZIndex } from '../enum/index'
 import { getModelStatusText } from '../tool/index'
 import TechHeader from '../components/TechHeader'
 import TechFooter from '../components/TechFooter'
+import {
+  DownOutlined,
+  EyeOutlined,
+  EyeInvisibleOutlined,
+} from '@ant-design/icons'
 import dayjs, { Dayjs } from 'dayjs'
 import zhCN from 'antd/locale/zh_CN'
 import './index.less'
@@ -56,7 +62,6 @@ const entityMock: BridgeEntity[] = [
     modelId: 'test-bridge-model1',
     epsg_3857: '13433492.4, 3692043.9, 45',
     uri: '/models/0808_3dtiles/tileset.json',
-    // uri: '/models/0808_with_metadata/tileset.json',
     nodes: {
       pillar1: {
         material: 'default',
@@ -317,7 +322,6 @@ const CesiumMap = React.memo(
         }
       }, [onNodeClick, onCameraChange, initialViewerInfo, setViewer])
 
-
       // 生成模型矩阵
       const getModelMatrix = useCallback(
         (entity: BridgeEntity) => {
@@ -383,7 +387,7 @@ const CesiumMap = React.memo(
                 modelMatrix={getModelMatrix(entity)}
                 onReady={(tileset: Cesium.Cesium3DTileset) => {
                   // 为tileset添加自定义id
-                  tileset.tilesetId = entity.id;
+                  tileset.tilesetId = entity.id
                   onTilesetReady?.(entity.id, tileset)
                 }}
               />
@@ -619,6 +623,7 @@ const EntityInfoPanel = ({
 }
 
 // 总的整合组件
+// 总的整合组件
 const Home = () => {
   const [modal, contextHolder] = Modal.useModal()
   const [selectedNode, setSelectedNode] = useState<{
@@ -630,8 +635,14 @@ const Home = () => {
   } | null>(null)
   const [showInfoPanel, setShowInfoPanel] = useState(false)
   const [cameraState, setCameraState] = useState<any>(null)
+  const [componentTree, setComponentTree] = useState<any[]>([])
+  const [treeVisible, setTreeVisible] = useState(false)
   const viewerRef = useRef<any>(null)
   const { viewer } = useCesiumViewer()
+  const discoveredFeaturesRef = useRef<Map<string, any>>(new Map())
+  const componentVisibilityRef = useRef<Map<string, boolean>>(new Map())
+  // 添加一个ref来跟踪所有被隐藏的构件
+  const hiddenComponentsRef = useRef<Set<string>>(new Set())
   // 在 Home 组件中添加 tileset 引用存储
   const tilesetsRef = useRef<Map<string, Cesium.Cesium3DTileset>>(new Map())
   // 存储当前高亮的要素
@@ -652,6 +663,259 @@ const Home = () => {
     return () => clearInterval(timer)
   }, [])
 
+  // 基础处理函数（无依赖）
+  const handleCameraChange = useCallback((state: any) => {
+    setCameraState(state)
+  }, [])
+
+  const handleTilesetLoad = useCallback(() => {
+    console.log('Tileset loaded')
+  }, [])
+
+  // 自定义树节点标题组件
+  const TreeNodeTitle = ({
+    title,
+    show,
+    onToggle,
+    componentName,
+  }: {
+    title: string
+    show: boolean
+    onToggle: () => void
+    componentName: string
+  }) => {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}
+      >
+        <span style={{ flex: 1 }}>{title}</span>
+        <Button
+          type='text'
+          icon={show ? <EyeOutlined /> : <EyeInvisibleOutlined />}
+          onClick={(e) => {
+            e.stopPropagation() // 阻止事件冒泡，避免触发节点选择
+            onToggle()
+          }}
+          style={{
+            color: show ? 'white' : 'gray',
+            fontSize: '12px',
+            width: '24px',
+            height: '24px',
+            minWidth: '24px',
+          }}
+        />
+      </div>
+    )
+  }
+
+  // 获取构件详细信息（依赖较少）
+  const getFeatureDetails = useCallback(
+    (tileset: Cesium.Cesium3DTileset, featureName: string) => {
+      let foundFeature: Cesium.Cesium3DTileFeature | null = null
+
+      // 递归遍历查找指定名称的构件
+      const traverse = (tile: Cesium.Cesium3DTile) => {
+        if (!tile || foundFeature) return
+
+        // 检查tile内容是否包含构件信息
+        if (tile.content && tile.content.features) {
+          // 遍历所有features
+          for (let i = 0; i < tile.content.features.length; i++) {
+            const feature = tile.content.features[i]
+            const name =
+              feature.getProperty('name') || `feature-${feature.featureId}`
+            if (name === featureName) {
+              foundFeature = feature
+              return
+            }
+          }
+        }
+
+        // 递归处理子tiles
+        if (tile.children && !foundFeature) {
+          for (let i = 0; i < tile.children.length; i++) {
+            traverse(tile.children[i])
+          }
+        }
+      }
+
+      // 从根tile开始遍历
+      if (tileset.root) {
+        traverse(tileset.root)
+      }
+
+      return foundFeature
+    },
+    []
+  )
+
+  // 处理名称显示/隐藏（基础函数）
+  const handleNameShow = useCallback(
+    (
+      componentName: string,
+      visible: boolean,
+      tilesetId: string = 'test-bridge-model1'
+    ) => {
+      if (!tilesetsRef) {
+        console.warn('TilesetsRef not found')
+        return
+      }
+
+      // 获取test-bridge-model1对应的tileset
+      const tileset = tilesetsRef.current.get(tilesetId)
+      if (!tilesetId || !tileset) {
+        console.warn('tilesetId not found')
+        return
+      }
+
+      // 更新隐藏列表
+      if (visible) {
+        // 如果要显示，从隐藏列表中移除
+        hiddenComponentsRef.current.delete(componentName)
+      } else {
+        // 如果要隐藏，添加到隐藏列表
+        hiddenComponentsRef.current.add(componentName)
+      }
+
+      // 构建条件数组，隐藏列表中的构件设为false，其他设为true
+      const conditions: [string | boolean, boolean][] = []
+
+      // 为每个隐藏的构件添加条件
+      hiddenComponentsRef.current.forEach((hiddenName) => {
+        conditions.push([`\${name} === '${hiddenName}'`, false])
+      })
+
+      // 默认显示所有其他构件
+      conditions.push([true, true])
+
+      // 使用Cesium3DTileStyle应用新的显示/隐藏状态
+      tileset.style = new Cesium.Cesium3DTileStyle({
+        show: {
+          conditions: conditions,
+        },
+      })
+
+      console.log(
+        `${
+          visible ? '显示' : '隐藏'
+        } test-bridge-model1 中的 ${componentName} 子构件`
+      )
+    },
+    [tilesetsRef]
+  )
+
+  const buildComponentTree = useCallback(() => {
+    const treeData: any[] = []
+
+    // 获取test-bridge-model1实体数据
+    const entityData = entityMock.find(
+      (item) => item.id === 'test-bridge-model1'
+    )
+
+    if (entityData) {
+      // 构建二级节点（构件节点）
+      const children: any[] = []
+
+      // 使用已发现的构件构建二级树
+      discoveredFeaturesRef.current.forEach((featureInfo, featureName) => {
+        const show = componentVisibilityRef.current.get(featureName) ?? true
+        children.push({
+          key: featureName,
+          title: (
+            <TreeNodeTitle
+              title={featureInfo.nodeName || featureName}
+              show={show}
+              onToggle={() => toggleComponentVisibility(featureName)}
+              componentName={featureName}
+            />
+          ),
+          isLeaf: true,
+          feature: featureInfo.feature,
+          show: show,
+        })
+      })
+
+      // 如果没有任何已发现的构件，使用预定义数据
+      if (children.length === 0 && entityData.nodes) {
+        Object.keys(entityData.nodes).forEach((nodeName) => {
+          const show = componentVisibilityRef.current.get(nodeName) ?? true
+          children.push({
+            key: nodeName,
+            title: (
+              <TreeNodeTitle
+                title={entityData.nodes![nodeName].modelName || nodeName}
+                show={show}
+                onToggle={() => toggleComponentVisibility(nodeName)}
+                componentName={nodeName}
+              />
+            ),
+            isLeaf: true,
+            show: show,
+          })
+        })
+      }
+
+      // 获取第一级节点的显示状态
+      const modelShow =
+        componentVisibilityRef.current.get('test-bridge-model1') ?? true
+
+      // 构建第一级节点
+      treeData.push({
+        key: 'test-bridge-model1',
+        title: (
+          <TreeNodeTitle
+            title={entityData.modelName || 'test模型'}
+            show={modelShow}
+            onToggle={() => toggleModelVisibility('test-bridge-model1')}
+            componentName='test-bridge-model1'
+          />
+        ),
+        children: children,
+        show: modelShow,
+      })
+    }
+
+    return treeData
+  }, [])
+  // 切换构件显示状态（依赖 handleNameShow）
+  const toggleComponentVisibility = useCallback(
+    (componentName: string) => {
+      // 更新显示状态
+      const currentVisibility =
+        componentVisibilityRef.current.get(componentName) ?? true
+      const newVisibility = !currentVisibility
+      componentVisibilityRef.current.set(componentName, newVisibility)
+
+      // 应用到3D模型
+      handleNameShow(componentName, newVisibility)
+
+      // 检查是否所有子构件都隐藏了，如果是，则也隐藏父级模型
+      const entityData = entityMock.find(
+        (item) => item.id === 'test-bridge-model1'
+      )
+      if (entityData && entityData.nodes) {
+        const allHidden = Object.keys(entityData.nodes).every(
+          (nodeName) => !componentVisibilityRef.current.get(nodeName)
+        )
+
+        // 更新模型的显示状态
+        if (allHidden) {
+          componentVisibilityRef.current.set('test-bridge-model1', false)
+        } else {
+          componentVisibilityRef.current.set('test-bridge-model1', true)
+        }
+      }
+
+      // 重新构建整个树以确保状态一致性
+      const treeData = buildComponentTree()
+      setComponentTree(treeData)
+    },
+    [handleNameShow, buildComponentTree]
+  )
   // 处理3D Tiles要素点击
   const handleTileFeatureClick = useCallback(
     (
@@ -759,15 +1023,6 @@ const Home = () => {
     },
     [handleTileFeatureClick]
   )
-  // 相机变化处理
-  const handleCameraChange = useCallback((state: any) => {
-    setCameraState(state)
-  }, [])
-
-  // 3D Tiles加载完成处理
-  const handleTilesetLoad = useCallback(() => {
-    console.log('Tileset loaded')
-  }, [])
 
   // 关闭信息面板时恢复材质
   const handleClosePanel = useCallback(() => {
@@ -790,10 +1045,107 @@ const Home = () => {
   const handleTilesetReady = useCallback(
     (entityId: string, tileset: Cesium.Cesium3DTileset) => {
       tilesetsRef.current.set(entityId, tileset)
+
+      // 当test-bridge-model1加载完成时，构建初始构件树
+      if (entityId === 'test-bridge-model1') {
+        // 初始化模型为可见
+        componentVisibilityRef.current.set('test-bridge-model1', true)
+
+        // 初始化所有构件为可见
+        const entityData = entityMock.find(
+          (item) => item.id === 'test-bridge-model1'
+        )
+        if (entityData && entityData.nodes) {
+          Object.keys(entityData.nodes).forEach((nodeName) => {
+            componentVisibilityRef.current.set(nodeName, true)
+          })
+        }
+
+        const treeData = buildComponentTree()
+        setComponentTree(treeData)
+      }
     },
-    []
+    [buildComponentTree]
   )
 
+  // 加载构件树
+  const loadComponentTree = useCallback(
+    (tilesetId: string = 'test-bridge-model1', show: boolean = true) => {
+      const tileset = tilesetsRef.current.get(tilesetId)
+      if (!tileset) {
+        console.warn(`未找到ID为${tilesetId}的tileset`)
+        return
+      }
+
+      // 构建构件树
+      const treeData = buildComponentTree()
+      console.log('tileset', tileset)
+      console.log('构件树数据：', treeData)
+      if (show) {
+        setComponentTree(treeData)
+        setTreeVisible(true)
+      } else {
+        setTreeVisible(false)
+      }
+    },
+    [buildComponentTree]
+  )
+
+  // 点击构件树节点
+  const onTreeNodeSelect = useCallback(
+    (selectedKeys: any[], info: any) => {
+      console.log('选中节点:', selectedKeys, info)
+
+      // 只处理叶子节点（实际构件）
+      if (selectedKeys.length > 0 && info.node.isFeature) {
+        const featureName = info.node.key
+        const tilesetId = 'test-bridge-model1' // 假设我们只处理这个模型
+
+        // 获取tileset
+        const tileset = tilesetsRef.current.get(tilesetId)
+        if (!tileset) {
+          console.warn(`未找到ID为${tilesetId}的tileset`)
+          return
+        }
+
+        // 查找构件
+        const feature = getFeatureDetails(tileset, featureName)
+        if (feature) {
+          // 触发点击处理
+          handleTileFeatureClick(tilesetId, feature, featureName)
+        } else {
+          console.warn(`未找到构件: ${featureName}`)
+        }
+      }
+    },
+    [handleTileFeatureClick, getFeatureDetails]
+  )
+  // 添加控制整个模型显示/隐藏的函数
+  const toggleModelVisibility = useCallback(
+    (modelId: string) => {
+      // 更新模型的显示状态
+      const currentVisibility =
+        componentVisibilityRef.current.get(modelId) ?? true
+      const newVisibility = !currentVisibility
+      componentVisibilityRef.current.set(modelId, newVisibility)
+
+      // 获取模型实体数据
+      const entityData = entityMock.find((item) => item.id === modelId)
+      if (entityData && entityData.nodes) {
+        // 设置所有子构件的显示状态与模型一致
+        Object.keys(entityData.nodes).forEach((nodeName) => {
+          componentVisibilityRef.current.set(nodeName, newVisibility)
+          // 更新3D模型中对应构件的显示状态
+          handleNameShow(nodeName, newVisibility, modelId)
+        })
+      }
+
+      // 重新构建树
+      const treeData = buildComponentTree()
+      setComponentTree(treeData)
+    },
+    [handleNameShow, buildComponentTree]
+  )
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
       {contextHolder}
@@ -821,7 +1173,7 @@ const Home = () => {
         allEntityData={entityMock}
       />
 
-      {/* <div
+      <div
         style={{
           position: 'absolute',
           top: 20,
@@ -829,8 +1181,34 @@ const Home = () => {
           zIndex: MapItemZIndex.TOOLBAR,
         }}
       >
-
-      </div> */}
+        {/* 自定义按钮 */}
+        <ConfigProvider theme={darkTheme} locale={zhCN}>
+          {!treeVisible ? (
+            <Button
+              onClick={() => loadComponentTree('test-bridge-model1', true)}
+              className='cesium-button custom-tool-btn'
+            >
+              显示构件树
+            </Button>
+          ) : (
+            <Button
+              onClick={() => loadComponentTree('test-bridge-model1', false)}
+              className='cesium-button custom-tool-btn'
+            >
+              隐藏构件树
+            </Button>
+          )}
+          {treeVisible && (
+            <Tree
+              treeData={componentTree}
+              onSelect={onTreeNodeSelect}
+              defaultExpandAll
+              showLine
+              switcherIcon={<DownOutlined />}
+            />
+          )}
+        </ConfigProvider>
+      </div>
       <TechFooter zIndex={MapItemZIndex.FOOTER} />
     </div>
   )
